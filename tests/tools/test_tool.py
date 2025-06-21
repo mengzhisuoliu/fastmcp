@@ -1,12 +1,19 @@
 import pytest
-from mcp.types import EmbeddedResource, ImageContent, TextContent, TextResourceContents
+from mcp.types import (
+    AudioContent,
+    EmbeddedResource,
+    ImageContent,
+    TextContent,
+    TextResourceContents,
+)
 from pydantic import AnyUrl, BaseModel
 
-from fastmcp import FastMCP, Image
+from fastmcp import FastMCP
 from fastmcp.client import Client
 from fastmcp.exceptions import ToolError
 from fastmcp.tools.tool import Tool, _convert_to_content
 from fastmcp.utilities.tests import temporary_settings
+from fastmcp.utilities.types import Audio, File, Image
 
 
 class TestToolFromFunction:
@@ -96,6 +103,31 @@ class TestToolFromFunction:
         result = await tool.run({"data": "test.png"})
         assert tool.parameters["properties"]["data"]["type"] == "string"
         assert isinstance(result[0], ImageContent)
+
+    async def test_tool_with_audio_return(self):
+        def audio_tool(data: bytes) -> Audio:
+            return Audio(data=data)
+
+        tool = Tool.from_function(audio_tool)
+
+        result = await tool.run({"data": "test.wav"})
+        assert tool.parameters["properties"]["data"]["type"] == "string"
+        assert isinstance(result[0], AudioContent)
+
+    async def test_tool_with_file_return(self):
+        def file_tool(data: bytes) -> File:
+            return File(data=data, format="octet-stream")
+
+        tool = Tool.from_function(file_tool)
+
+        result = await tool.run({"data": "test.bin"})
+        assert tool.parameters["properties"]["data"]["type"] == "string"
+        assert len(result) == 1
+        assert isinstance(result[0], EmbeddedResource)
+        assert result[0].type == "resource"
+        assert hasattr(result[0], "resource")
+        resource = result[0].resource
+        assert resource.mimeType == "application/octet-stream"
 
     def test_non_callable_fn(self):
         with pytest.raises(TypeError, match="not a callable object"):
@@ -320,7 +352,7 @@ class TestLegacyToolJsonParsing:
         """Test JSON string to collection type coercion."""
         mcp = FastMCP()
 
-        @mcp.tool()
+        @mcp.tool
         def process_list(items: list[int]) -> int:
             return sum(items)
 
@@ -335,7 +367,7 @@ class TestLegacyToolJsonParsing:
         """Test that a list coercion error is raised if the input is not a valid list."""
         mcp = FastMCP()
 
-        @mcp.tool()
+        @mcp.tool
         def process_list(items: list[int]) -> int:
             return sum(items)
 
@@ -350,7 +382,7 @@ class TestLegacyToolJsonParsing:
         """Test JSON string to dict type coercion."""
         mcp = FastMCP()
 
-        @mcp.tool()
+        @mcp.tool
         def process_dict(data: dict[str, int]) -> int:
             return sum(data.values())
 
@@ -365,7 +397,7 @@ class TestLegacyToolJsonParsing:
         """Test JSON string to set type coercion."""
         mcp = FastMCP()
 
-        @mcp.tool()
+        @mcp.tool
         def process_set(items: set[int]) -> int:
             assert isinstance(items, set)
             return sum(items)
@@ -378,7 +410,7 @@ class TestLegacyToolJsonParsing:
         """Test JSON string to tuple type coercion."""
         mcp = FastMCP()
 
-        @mcp.tool()
+        @mcp.tool
         def process_tuple(items: tuple[int, str]) -> int:
             assert isinstance(items, tuple)
             return items[0] + len(items[1])
@@ -439,6 +471,49 @@ class TestConvertResultToContent:
         assert len(result) == 1
         assert isinstance(result[0], ImageContent)
         assert result[0].data == "ZmFrZWltYWdlZGF0YQ=="
+
+    def test_audio_object_result(self):
+        """Test that an Audio object is converted to AudioContent."""
+        audio_obj = Audio(data=b"fakeaudiodata")
+
+        result = _convert_to_content(audio_obj)
+
+        assert isinstance(result, list)
+        assert len(result) == 1
+        assert isinstance(result[0], AudioContent)
+        assert result[0].data == "ZmFrZWF1ZGlvZGF0YQ=="
+
+    def test_file_object_result(self):
+        """Test that a File object is converted to EmbeddedResource with BlobResourceContents."""
+        file_obj = File(data=b"filedata", format="octet-stream")
+
+        result = _convert_to_content(file_obj)
+
+        assert isinstance(result, list)
+        assert len(result) == 1
+        assert isinstance(result[0], EmbeddedResource)
+        assert result[0].type == "resource"
+        assert hasattr(result[0], "resource")
+        resource = result[0].resource
+        assert resource.mimeType == "application/octet-stream"
+        # Check for blob attribute and its value
+        assert hasattr(resource, "blob")
+        assert getattr(resource, "blob") == "ZmlsZWRhdGE="  # base64 encoded "filedata"
+        # Convert URI to string for startswith check
+        assert str(resource.uri).startswith("file:///resource.octet-stream")
+
+    def test_file_object_text_result(self):
+        """Test that a File object with text data is converted to EmbeddedResource with TextResourceContents."""
+        file_obj = File(data=b"sometext", format="plain")
+        result = _convert_to_content(file_obj)
+        assert isinstance(result, list)
+        assert len(result) == 1
+        assert isinstance(result[0], EmbeddedResource)
+        assert result[0].type == "resource"
+        resource = result[0].resource
+        assert isinstance(resource, TextResourceContents)
+        assert resource.mimeType == "text/plain"
+        assert resource.text == "sometext"
 
     def test_basic_type_result(self):
         """Test that a basic type is converted to TextContent."""
@@ -523,6 +598,61 @@ class TestConvertResultToContent:
 
         image_item = next(item for item in result if isinstance(item, ImageContent))
         assert image_item.data == "ZmFrZWltYWdlZGF0YQ=="
+
+    def test_list_of_mixed_types_with_audio(self):
+        """Test that a list of mixed types including Audio is converted correctly."""
+        content1 = TextContent(type="text", text="hello")
+        audio_obj = Audio(data=b"fakeaudiodata")
+        basic_data = {"a": 1}
+        result = _convert_to_content([content1, audio_obj, basic_data])
+
+        assert isinstance(result, list)
+        assert len(result) == 3
+
+        text_content_count = sum(isinstance(item, TextContent) for item in result)
+        audio_content_count = sum(isinstance(item, AudioContent) for item in result)
+
+        assert text_content_count == 2
+        assert audio_content_count == 1
+
+        text_item = next(item for item in result if isinstance(item, TextContent))
+        assert text_item.text == '{\n  "a": 1\n}'
+
+        audio_item = next(item for item in result if isinstance(item, AudioContent))
+        assert audio_item.data == "ZmFrZWF1ZGlvZGF0YQ=="
+
+    def test_list_of_mixed_types_with_file(self):
+        """Test that a list of mixed types including File is converted correctly."""
+        content1 = TextContent(type="text", text="hello")
+        file_obj = File(data=b"filedata", format="octet-stream")
+        basic_data = {"a": 1}
+        result = _convert_to_content([content1, file_obj, basic_data])
+
+        assert isinstance(result, list)
+        assert len(result) == 3
+
+        text_content_count = sum(isinstance(item, TextContent) for item in result)
+        embedded_content_count = sum(
+            isinstance(item, EmbeddedResource) and item.type == "resource"
+            for item in result
+        )
+
+        assert text_content_count == 2
+        assert embedded_content_count == 1
+
+        text_item = next(item for item in result if isinstance(item, TextContent))
+        assert text_item.text == '{\n  "a": 1\n}'
+
+        embedded_item = next(
+            item
+            for item in result
+            if isinstance(item, EmbeddedResource) and item.type == "resource"
+        )
+        resource = embedded_item.resource
+        assert resource.mimeType == "application/octet-stream"
+        # Check for blob attribute and its value
+        assert hasattr(resource, "blob")
+        assert getattr(resource, "blob") == "ZmlsZWRhdGE="
 
     def test_empty_list(self):
         """Test that an empty list results in an empty list."""
