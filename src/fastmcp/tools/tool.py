@@ -1,130 +1,277 @@
 from __future__ import annotations
 
 import inspect
-import json
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Annotated, Any
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 
+import mcp.types
 import pydantic_core
-from mcp.types import EmbeddedResource, ImageContent, TextContent, ToolAnnotations
+from mcp.types import ContentBlock, TextContent, ToolAnnotations
 from mcp.types import Tool as MCPTool
-from pydantic import BaseModel, BeforeValidator, Field
+from pydantic import Field, PydanticSchemaGenerationError
 
-import fastmcp
 from fastmcp.server.dependencies import get_context
+from fastmcp.utilities.components import FastMCPComponent
 from fastmcp.utilities.json_schema import compress_schema
 from fastmcp.utilities.logging import get_logger
 from fastmcp.utilities.types import (
+    Audio,
+    File,
     Image,
-    _convert_set_defaults,
+    NotSet,
+    NotSetT,
     find_kwarg_by_type,
     get_cached_typeadapter,
+    replace_type,
 )
 
 if TYPE_CHECKING:
-    pass
+    from fastmcp.tools.tool_transform import ArgTransform, TransformedTool
 
 logger = get_logger(__name__)
+
+
+class _UnserializableType:
+    pass
 
 
 def default_serializer(data: Any) -> str:
     return pydantic_core.to_json(data, fallback=str, indent=2).decode()
 
 
-class Tool(BaseModel):
+def _wrap_schema_if_needed(schema: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Wrap non-object schemas with result property for structured output.
+
+    This wrapping allows primitive types (int, str, etc.) to be returned as
+    structured content by placing them under a "result" key.
+
+    Args:
+        schema: The JSON schema to potentially wrap
+
+    Returns:
+        Wrapped schema if needed, or original schema if already an object type
+    """
+    if schema and schema.get("type") != "object":
+        return {
+            "type": "object",
+            "properties": {"result": schema},
+            "x-fastmcp-wrap-result": True,
+        }
+    return schema
+
+
+class ToolResult:
+    def __init__(
+        self,
+        content: list[ContentBlock] | Any | None = None,
+        structured_content: dict[str, Any] | Any | None = None,
+    ):
+        if content is None and structured_content is None:
+            raise ValueError("Either content or structured_content must be provided")
+        elif content is None:
+            content = structured_content
+
+        self.content = _convert_to_content(content)
+
+        if structured_content is not None:
+            try:
+                structured_content = pydantic_core.to_jsonable_python(
+                    structured_content
+                )
+            except pydantic_core.PydanticSerializationError as e:
+                logger.error(
+                    f"Could not serialize structured content. If this is unexpected, set your tool's output_schema to None to disable automatic serialization: {e}"
+                )
+                raise
+            if not isinstance(structured_content, dict):
+                raise ValueError(
+                    "structured_content must be a dict or None. "
+                    f"Got {type(structured_content).__name__}: {structured_content!r}. "
+                    "Tools should wrap non-dict values based on their output_schema."
+                )
+        self.structured_content: dict[str, Any] | None = structured_content
+
+    def to_mcp_result(
+        self,
+    ) -> list[ContentBlock] | tuple[list[ContentBlock], dict[str, Any]]:
+        if self.structured_content is None:
+            return self.content
+        return self.content, self.structured_content
+
+
+class Tool(FastMCPComponent):
     """Internal tool registration info."""
 
+    parameters: Annotated[
+        dict[str, Any], Field(description="JSON schema for tool parameters")
+    ]
+    output_schema: Annotated[
+        dict[str, Any] | None, Field(description="JSON schema for tool output")
+    ] = None
+    annotations: Annotated[
+        ToolAnnotations | None,
+        Field(description="Additional annotations about the tool"),
+    ] = None
+    serializer: Annotated[
+        Callable[[Any], str] | None,
+        Field(description="Optional custom serializer for tool results"),
+    ] = None
+
+    def enable(self) -> None:
+        super().enable()
+        try:
+            context = get_context()
+            context._queue_tool_list_changed()  # type: ignore[private-use]
+        except RuntimeError:
+            pass  # No context available
+
+    def disable(self) -> None:
+        super().disable()
+        try:
+            context = get_context()
+            context._queue_tool_list_changed()  # type: ignore[private-use]
+        except RuntimeError:
+            pass  # No context available
+
+    def to_mcp_tool(self, **overrides: Any) -> MCPTool:
+        if self.title:
+            title = self.title
+        elif self.annotations and self.annotations.title:
+            title = self.annotations.title
+        else:
+            title = None
+
+        kwargs = {
+            "name": self.name,
+            "description": self.description,
+            "inputSchema": self.parameters,
+            "outputSchema": self.output_schema,
+            "annotations": self.annotations,
+            "title": title,
+        }
+        return MCPTool(**kwargs | overrides)
+
+    @staticmethod
+    def from_function(
+        fn: Callable[..., Any],
+        name: str | None = None,
+        title: str | None = None,
+        description: str | None = None,
+        tags: set[str] | None = None,
+        annotations: ToolAnnotations | None = None,
+        exclude_args: list[str] | None = None,
+        output_schema: dict[str, Any] | None | NotSetT | Literal[False] = NotSet,
+        serializer: Callable[[Any], str] | None = None,
+        enabled: bool | None = None,
+    ) -> FunctionTool:
+        """Create a Tool from a function."""
+        return FunctionTool.from_function(
+            fn=fn,
+            name=name,
+            title=title,
+            description=description,
+            tags=tags,
+            annotations=annotations,
+            exclude_args=exclude_args,
+            output_schema=output_schema,
+            serializer=serializer,
+            enabled=enabled,
+        )
+
+    async def run(self, arguments: dict[str, Any]) -> ToolResult:
+        """
+        Run the tool with arguments.
+
+        This method is not implemented in the base Tool class and must be
+        implemented by subclasses.
+
+        `run()` can EITHER return a list of ContentBlocks, or a tuple of
+        (list of ContentBlocks, dict of structured output).
+        """
+        raise NotImplementedError("Subclasses must implement run()")
+
+    @classmethod
+    def from_tool(
+        cls,
+        tool: Tool,
+        transform_fn: Callable[..., Any] | None = None,
+        name: str | None = None,
+        transform_args: dict[str, ArgTransform] | None = None,
+        description: str | None = None,
+        tags: set[str] | None = None,
+        annotations: ToolAnnotations | None = None,
+        output_schema: dict[str, Any] | None | Literal[False] = None,
+        serializer: Callable[[Any], str] | None = None,
+        enabled: bool | None = None,
+    ) -> TransformedTool:
+        from fastmcp.tools.tool_transform import TransformedTool
+
+        return TransformedTool.from_tool(
+            tool=tool,
+            transform_fn=transform_fn,
+            name=name,
+            transform_args=transform_args,
+            description=description,
+            tags=tags,
+            annotations=annotations,
+            output_schema=output_schema,
+            serializer=serializer,
+            enabled=enabled,
+        )
+
+
+class FunctionTool(Tool):
     fn: Callable[..., Any]
-    name: str = Field(description="Name of the tool")
-    description: str | None = Field(
-        default=None, description="Description of what the tool does"
-    )
-    parameters: dict[str, Any] = Field(description="JSON schema for tool parameters")
-    tags: Annotated[set[str], BeforeValidator(_convert_set_defaults)] = Field(
-        default_factory=set, description="Tags for the tool"
-    )
-    annotations: ToolAnnotations | None = Field(
-        None, description="Additional annotations about the tool"
-    )
-    exclude_args: list[str] | None = Field(
-        None,
-        description="Arguments to exclude from the tool schema, such as State, Memory, or Credential",
-    )
-    serializer: Callable[[Any], str] | None = Field(
-        None, description="Optional custom serializer for tool results"
-    )
 
     @classmethod
     def from_function(
         cls,
         fn: Callable[..., Any],
         name: str | None = None,
+        title: str | None = None,
         description: str | None = None,
         tags: set[str] | None = None,
         annotations: ToolAnnotations | None = None,
         exclude_args: list[str] | None = None,
+        output_schema: dict[str, Any] | None | NotSetT | Literal[False] = NotSet,
         serializer: Callable[[Any], str] | None = None,
-    ) -> Tool:
+        enabled: bool | None = None,
+    ) -> FunctionTool:
         """Create a Tool from a function."""
-        from fastmcp.server.context import Context
 
-        # Reject functions with *args or **kwargs
-        sig = inspect.signature(fn)
-        for param in sig.parameters.values():
-            if param.kind == inspect.Parameter.VAR_POSITIONAL:
-                raise ValueError("Functions with *args are not supported as tools")
-            if param.kind == inspect.Parameter.VAR_KEYWORD:
-                raise ValueError("Functions with **kwargs are not supported as tools")
+        parsed_fn = ParsedFunction.from_function(fn, exclude_args=exclude_args)
 
-        if exclude_args:
-            for arg_name in exclude_args:
-                if arg_name not in sig.parameters:
-                    raise ValueError(
-                        f"Parameter '{arg_name}' in exclude_args does not exist in function."
-                    )
-                param = sig.parameters[arg_name]
-                if param.default == inspect.Parameter.empty:
-                    raise ValueError(
-                        f"Parameter '{arg_name}' in exclude_args must have a default value."
-                    )
-
-        func_name = name or getattr(fn, "__name__", None) or fn.__class__.__name__
-
-        if func_name == "<lambda>":
+        if name is None and parsed_fn.name == "<lambda>":
             raise ValueError("You must provide a name for lambda functions")
 
-        func_doc = description or fn.__doc__
+        if isinstance(output_schema, NotSetT):
+            output_schema = _wrap_schema_if_needed(parsed_fn.output_schema)
+        elif output_schema is False:
+            output_schema = None
+        # Note: explicit schemas (dict) are used as-is without auto-wrapping
 
-        # if the fn is a callable class, we need to get the __call__ method from here out
-        if not inspect.isroutine(fn):
-            fn = fn.__call__
-
-        type_adapter = get_cached_typeadapter(fn)
-        schema = type_adapter.json_schema()
-
-        prune_params: list[str] = []
-        context_kwarg = find_kwarg_by_type(fn, kwarg_type=Context)
-        if context_kwarg:
-            prune_params.append(context_kwarg)
-        if exclude_args:
-            prune_params.extend(exclude_args)
-
-        schema = compress_schema(schema, prune_params=prune_params)
+        # Validate that explicit schemas are object type for structured content
+        if output_schema is not None and isinstance(output_schema, dict):
+            if output_schema.get("type") != "object":
+                raise ValueError(
+                    f'Output schemas must have "type" set to "object" due to MCP spec limitations. Received: {output_schema!r}'
+                )
 
         return cls(
-            fn=fn,
-            name=func_name,
-            description=func_doc,
-            parameters=schema,
-            tags=tags or set(),
+            fn=parsed_fn.fn,
+            name=name or parsed_fn.name,
+            title=title,
+            description=description or parsed_fn.description,
+            parameters=parsed_fn.input_schema,
+            output_schema=output_schema,
             annotations=annotations,
-            exclude_args=exclude_args,
+            tags=tags or set(),
             serializer=serializer,
+            enabled=enabled if enabled is not None else True,
         )
 
-    async def run(
-        self, arguments: dict[str, Any]
-    ) -> list[TextContent | ImageContent | EmbeddedResource]:
+    async def run(self, arguments: dict[str, Any]) -> ToolResult:
         """Run the tool with arguments."""
         from fastmcp.server.context import Context
 
@@ -134,71 +281,183 @@ class Tool(BaseModel):
         if context_kwarg and context_kwarg not in arguments:
             arguments[context_kwarg] = get_context()
 
-        if fastmcp.settings.settings.tool_attempt_parse_json_args:
-            # Pre-parse data from JSON in order to handle cases like `["a", "b", "c"]`
-            # being passed in as JSON inside a string rather than an actual list.
-            #
-            # Claude desktop is prone to this - in fact it seems incapable of NOT doing
-            # this. For sub-models, it tends to pass dicts (JSON objects) as JSON strings,
-            # which can be pre-parsed here.
-            signature = inspect.signature(self.fn)
-            for param_name in self.parameters["properties"]:
-                arg = arguments.get(param_name, None)
-                # if not in signature, we won't have annotations, so skip logic
-                if param_name not in signature.parameters:
-                    continue
-                # if not a string, we won't have a JSON to parse, so skip logic
-                if not isinstance(arg, str):
-                    continue
-                # skip if the type is a simple type (int, float, bool)
-                if signature.parameters[param_name].annotation in (
-                    int,
-                    float,
-                    bool,
-                ):
-                    continue
-                try:
-                    arguments[param_name] = json.loads(arg)
-
-                except json.JSONDecodeError:
-                    pass
-
         type_adapter = get_cached_typeadapter(self.fn)
         result = type_adapter.validate_python(arguments)
+
         if inspect.isawaitable(result):
             result = await result
 
-        return _convert_to_content(result, serializer=self.serializer)
+        if isinstance(result, ToolResult):
+            return result
 
-    def to_mcp_tool(self, **overrides: Any) -> MCPTool:
-        kwargs = {
-            "name": self.name,
-            "description": self.description,
-            "inputSchema": self.parameters,
-            "annotations": self.annotations,
-        }
-        return MCPTool(**kwargs | overrides)
+        unstructured_result = _convert_to_content(result, serializer=self.serializer)
 
-    def __eq__(self, other: object) -> bool:
-        if not isinstance(other, Tool):
-            return False
-        return self.model_dump() == other.model_dump()
+        structured_output = None
+        # First handle structured content based on output schema, if any
+        if self.output_schema is not None:
+            if self.output_schema.get("x-fastmcp-wrap-result"):
+                # Schema says wrap - always wrap in result key
+                structured_output = {"result": result}
+            else:
+                structured_output = result
+        # If no output schema, try to serialize the result. If it is a dict, use
+        # it as structured content. If it is not a dict, ignore it.
+        if structured_output is None:
+            try:
+                structured_output = pydantic_core.to_jsonable_python(result)
+                if not isinstance(structured_output, dict):
+                    structured_output = None
+            except Exception:
+                pass
+
+        return ToolResult(
+            content=unstructured_result,
+            structured_content=structured_output,
+        )
+
+
+@dataclass
+class ParsedFunction:
+    fn: Callable[..., Any]
+    name: str
+    description: str | None
+    input_schema: dict[str, Any]
+    output_schema: dict[str, Any] | None
+
+    @classmethod
+    def from_function(
+        cls,
+        fn: Callable[..., Any],
+        exclude_args: list[str] | None = None,
+        ignore_response_types: list[type] | None = None,
+        validate: bool = True,
+    ) -> ParsedFunction:
+        from fastmcp.server.context import Context
+
+        if validate:
+            sig = inspect.signature(fn)
+            # Reject functions with *args or **kwargs
+            for param in sig.parameters.values():
+                if param.kind == inspect.Parameter.VAR_POSITIONAL:
+                    raise ValueError("Functions with *args are not supported as tools")
+                if param.kind == inspect.Parameter.VAR_KEYWORD:
+                    raise ValueError(
+                        "Functions with **kwargs are not supported as tools"
+                    )
+
+            # Reject exclude_args that don't exist in the function or don't have a default value
+            if exclude_args:
+                for arg_name in exclude_args:
+                    if arg_name not in sig.parameters:
+                        raise ValueError(
+                            f"Parameter '{arg_name}' in exclude_args does not exist in function."
+                        )
+                    param = sig.parameters[arg_name]
+                    if param.default == inspect.Parameter.empty:
+                        raise ValueError(
+                            f"Parameter '{arg_name}' in exclude_args must have a default value."
+                        )
+
+        # collect name and doc before we potentially modify the function
+        fn_name = getattr(fn, "__name__", None) or fn.__class__.__name__
+        fn_doc = inspect.getdoc(fn)
+
+        # if the fn is a callable class, we need to get the __call__ method from here out
+        if not inspect.isroutine(fn):
+            fn = fn.__call__
+        # if the fn is a staticmethod, we need to work with the underlying function
+        if isinstance(fn, staticmethod):
+            fn = fn.__func__
+
+        prune_params: list[str] = []
+        context_kwarg = find_kwarg_by_type(fn, kwarg_type=Context)
+        if context_kwarg:
+            prune_params.append(context_kwarg)
+        if exclude_args:
+            prune_params.extend(exclude_args)
+
+        input_type_adapter = get_cached_typeadapter(fn)
+        input_schema = input_type_adapter.json_schema()
+        input_schema = compress_schema(input_schema, prune_params=prune_params)
+
+        output_schema = None
+        output_type = inspect.signature(fn).return_annotation
+
+        if output_type not in (inspect._empty, None, Any, ...):
+            # there are a variety of types that we don't want to attempt to
+            # serialize because they are either used by FastMCP internally,
+            # or are MCP content types that explicitly don't form structured
+            # content. By replacing them with an explicitly unserializable type,
+            # we ensure that no output schema is automatically generated.
+            output_type = replace_type(
+                output_type,
+                {
+                    t: _UnserializableType
+                    for t in (
+                        Image,
+                        Audio,
+                        File,
+                        ToolResult,
+                        mcp.types.TextContent,
+                        mcp.types.ImageContent,
+                        mcp.types.AudioContent,
+                        mcp.types.ResourceLink,
+                        mcp.types.EmbeddedResource,
+                    )
+                },
+            )
+
+            try:
+                output_type_adapter = get_cached_typeadapter(output_type)
+                output_schema = output_type_adapter.json_schema()
+            except PydanticSchemaGenerationError as e:
+                if "_UnserializableType" not in str(e):
+                    logger.debug(f"Unable to generate schema for type {output_type!r}")
+
+        return cls(
+            fn=fn,
+            name=fn_name,
+            description=fn_doc,
+            input_schema=input_schema,
+            output_schema=output_schema or None,
+        )
+
+        try:
+            output_type_adapter = get_cached_typeadapter(output_type)
+            output_schema = output_type_adapter.json_schema()
+        except PydanticSchemaGenerationError as e:
+            if "_UnserializableType" not in str(e):
+                logger.debug(f"Unable to generate schema for type {output_type!r}")
+
+        return cls(
+            fn=fn,
+            name=fn_name,
+            description=fn_doc,
+            input_schema=input_schema,
+            output_schema=output_schema or None,
+        )
 
 
 def _convert_to_content(
     result: Any,
     serializer: Callable[[Any], str] | None = None,
     _process_as_single_item: bool = False,
-) -> list[TextContent | ImageContent | EmbeddedResource]:
+) -> list[ContentBlock]:
     """Convert a result to a sequence of content objects."""
     if result is None:
         return []
 
-    if isinstance(result, TextContent | ImageContent | EmbeddedResource):
+    if isinstance(result, ContentBlock):
         return [result]
 
     if isinstance(result, Image):
         return [result.to_image_content()]
+
+    elif isinstance(result, Audio):
+        return [result.to_audio_content()]
+
+    elif isinstance(result, File):
+        return [result.to_resource_content()]
 
     if isinstance(result, list | tuple) and not _process_as_single_item:
         # if the result is a list, then it could either be a list of MCP types,
@@ -211,7 +470,7 @@ def _convert_to_content(
         other_content = []
 
         for item in result:
-            if isinstance(item, TextContent | ImageContent | EmbeddedResource | Image):
+            if isinstance(item, ContentBlock | Image | Audio | File):
                 mcp_types.append(_convert_to_content(item)[0])
             else:
                 other_content.append(item)

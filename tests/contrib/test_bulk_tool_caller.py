@@ -1,7 +1,7 @@
 from typing import Any
 
 import pytest
-from mcp.types import EmbeddedResource, ImageContent, TextContent
+from mcp.types import TextContent
 
 from fastmcp import FastMCP
 from fastmcp.contrib.bulk_tool_caller.bulk_tool_caller import (
@@ -9,8 +9,7 @@ from fastmcp.contrib.bulk_tool_caller.bulk_tool_caller import (
     CallToolRequest,
     CallToolRequestResult,
 )
-
-ContentType = TextContent | ImageContent | EmbeddedResource
+from fastmcp.tools.tool import Tool
 
 
 class ToolException(Exception):
@@ -60,7 +59,10 @@ async def no_return_tool(arg1: str) -> None:
 def no_return_tool_result_factory(arg1: str) -> CallToolRequestResult:
     """A tool that returns a result based on the input arguments."""
     return CallToolRequestResult(
-        isError=False, content=[], tool="no_return_tool", arguments={"arg1": arg1}
+        isError=False,
+        content=[],
+        tool="no_return_tool",
+        arguments={"arg1": arg1},
     )
 
 
@@ -68,9 +70,9 @@ def no_return_tool_result_factory(arg1: str) -> CallToolRequestResult:
 def live_server_with_tool() -> FastMCP:
     """Fixture to create a FastMCP server instance with the echo_tool registered."""
     server = FastMCP()
-    server.add_tool(echo_tool)
-    server.add_tool(error_tool)
-    server.add_tool(no_return_tool)
+    server.add_tool(Tool.from_function(echo_tool))
+    server.add_tool(Tool.from_function(error_tool))
+    server.add_tool(Tool.from_function(no_return_tool))
     return server
 
 

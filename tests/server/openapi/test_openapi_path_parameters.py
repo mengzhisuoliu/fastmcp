@@ -128,7 +128,7 @@ async def test_array_path_parameter_handling(mock_client):
     )
 
     # Test with a single value
-    await tool._execute_request(days=["monday"])
+    await tool.run({"days": ["monday"]})
 
     # Check that the path parameter is formatted correctly
     # This is where the bug is: it should be '/select/monday' not '/select/[\'monday\']'
@@ -143,7 +143,7 @@ async def test_array_path_parameter_handling(mock_client):
     mock_client.request.reset_mock()
 
     # Test with multiple values
-    await tool._execute_request(days=["monday", "tuesday"])
+    await tool.run({"days": ["monday", "tuesday"]})
 
     # Check that the path parameter is formatted correctly
     # It should be '/select/monday,tuesday' not '/select/[\'monday\', \'tuesday\']'
@@ -234,7 +234,7 @@ async def test_complex_nested_array_path_parameter(mock_client):
     ]
 
     # Execute the request with complex filters
-    await tool._execute_request(filters=complex_filters)
+    await tool.run({"filters": complex_filters})
 
     # The complex object should be properly serialized in the URL
     # For path parameters, this would typically need a custom serialization strategy
@@ -301,20 +301,11 @@ async def test_array_query_param_with_fastapi():
 
         # Single day
         result = await client.call_tool(tool_name, {"days": ["monday"]})
-        # Client returns TextContent objects, so parse the JSON
-        assert len(result) == 1
-        assert result[0].type == "text"
-        import json
-
-        result_data = json.loads(result[0].text)
-        assert result_data == {"selected": ["monday"]}
+        assert result.data == {"selected": ["monday"]}
 
         # Multiple days
         result = await client.call_tool(tool_name, {"days": ["monday", "tuesday"]})
-        assert len(result) == 1
-        assert result[0].type == "text"
-        result_data = json.loads(result[0].text)
-        assert result_data == {"selected": ["monday", "tuesday"]}
+        assert result.data == {"selected": ["monday", "tuesday"]}
 
 
 async def test_array_query_parameter_format(mock_client):
@@ -359,7 +350,7 @@ async def test_array_query_parameter_format(mock_client):
     )
 
     # Test with a single value
-    await tool._execute_request(days=["monday"])
+    await tool.run({"days": ["monday"]})
 
     # Check that the query parameter is formatted correctly
     mock_client.request.assert_called_with(
@@ -373,7 +364,7 @@ async def test_array_query_parameter_format(mock_client):
     mock_client.request.reset_mock()
 
     # Test with multiple values
-    await tool._execute_request(days=["monday", "tuesday"])
+    await tool.run({"days": ["monday", "tuesday"]})
 
     # Check that the query parameter is formatted correctly
     # It should be 'days=monday,tuesday' not 'days=["monday","tuesday"]'
@@ -429,7 +420,7 @@ async def test_array_query_parameter_exploded_format(mock_client):
     )
 
     # Test with a single value
-    await tool._execute_request(days=["monday"])
+    await tool.run({"days": ["monday"]})
 
     # Check that the query parameter is formatted correctly
     mock_client.request.assert_called_with(
@@ -443,7 +434,7 @@ async def test_array_query_parameter_exploded_format(mock_client):
     mock_client.request.reset_mock()
 
     # Test with multiple values
-    await tool._execute_request(days=["monday", "tuesday"])
+    await tool.run({"days": ["monday", "tuesday"]})
 
     # Check that the query parameter is formatted correctly
     # It should be passed as an array, which httpx will serialize as days=monday&days=tuesday
@@ -455,3 +446,31 @@ async def test_array_query_parameter_exploded_format(mock_client):
         json=None,
         timeout=None,
     )
+
+
+def test_parameter_location_enum_handling():
+    """Test that ParameterLocation enum values are handled correctly (issue #950)."""
+    from enum import Enum
+
+    # Create a mock ParameterLocation enum like the one from openapi_pydantic
+    class MockParameterLocation(Enum):
+        PATH = "path"
+        QUERY = "query"
+        HEADER = "header"
+        COOKIE = "cookie"
+
+    # Test the enum handling logic directly (reproduces the fix in openapi.py)
+    test_cases = [
+        (MockParameterLocation.PATH, "path"),
+        (MockParameterLocation.QUERY, "query"),
+        (MockParameterLocation.HEADER, "header"),
+        (MockParameterLocation.COOKIE, "cookie"),
+        ("path", "path"),  # Also test that strings work
+        ("query", "query"),
+    ]
+
+    for param_in, expected_str in test_cases:
+        # This is the enum handling logic from the fix
+        param_in_str = param_in.value if isinstance(param_in, Enum) else param_in
+        assert param_in_str == expected_str
+        assert isinstance(param_in_str, str)

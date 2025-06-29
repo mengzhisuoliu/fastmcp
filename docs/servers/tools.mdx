@@ -24,14 +24,14 @@ This allows LLMs to perform tasks like querying databases, calling APIs, making 
 
 ### The `@tool` Decorator
 
-Creating a tool is as simple as decorating a Python function with `@mcp.tool()`:
+Creating a tool is as simple as decorating a Python function with `@mcp.tool`:
 
 ```python
 from fastmcp import FastMCP
 
 mcp = FastMCP(name="CalculatorServer")
 
-@mcp.tool()
+@mcp.tool
 def add(a: int, b: int) -> int:
     """Adds two integer numbers together."""
     return a + b
@@ -49,9 +49,68 @@ The way you define your Python function dictates how the tool appears and behave
 Functions with `*args` or `**kwargs` are not supported as tools. This restriction exists because FastMCP needs to generate a complete parameter schema for the MCP protocol, which isn't possible with variable argument lists.
 </Tip>
 
-### Parameters
+#### Decorator Arguments
 
-#### Annotations
+While FastMCP infers the name and description from your function, you can override these and add additional metadata using arguments to the `@mcp.tool` decorator:
+
+```python
+@mcp.tool(
+    name="find_products",           # Custom tool name for the LLM
+    description="Search the product catalog with optional category filtering.", # Custom description
+    tags={"catalog", "search"},      # Optional tags for organization/filtering
+)
+def search_products_implementation(query: str, category: str | None = None) -> list[dict]:
+    """Internal function description (ignored if description is provided above)."""
+    # Implementation...
+    print(f"Searching for '{query}' in category '{category}'")
+    return [{"id": 2, "name": "Another Product"}]
+```
+
+<Card icon="code" title="@tool Decorator Arguments">
+<ParamField body="name" type="str | None">
+  Sets the explicit tool name exposed via MCP. If not provided, uses the function name
+</ParamField>
+
+<ParamField body="description" type="str | None">
+  Provides the description exposed via MCP. If set, the function's docstring is ignored for this purpose
+</ParamField>
+
+<ParamField body="tags" type="set[str] | None">
+  A set of strings to categorize the tool. Clients might use tags to filter or group available tools
+</ParamField>
+
+<ParamField body="enabled" type="bool" default="True">
+  A boolean to enable or disable the tool. See [Disabling Tools](#disabling-tools) for more information
+</ParamField>
+
+<ParamField body="exclude_args" type="list[str] | None">
+  A list of argument names to exclude from the tool schema shown to the LLM. See [Excluding Arguments](#excluding-arguments) for more information
+</ParamField>
+
+<ParamField body="annotations" type="ToolAnnotations | dict | None">
+    An optional `ToolAnnotations` object or dictionary to add additional metadata about the tool.
+  <Expandable title="ToolAnnotations attributes">
+    <ParamField body="title" type="str | None">
+      A human-readable title for the tool.
+    </ParamField>
+    <ParamField body="readOnlyHint" type="bool | None">
+      If true, the tool does not modify its environment.
+    </ParamField>
+    <ParamField body="destructiveHint" type="bool | None">
+      If true, the tool may perform destructive updates to its environment.
+    </ParamField>
+    <ParamField body="idempotentHint" type="bool | None">
+      If true, calling the tool repeatedly with the same arguments will have no additional effect on the its environment.
+    </ParamField>
+    <ParamField body="openWorldHint" type="bool | None">
+      If true, this tool may interact with an "open world" of external entities. If false, the tool's domain of interaction is closed.
+    </ParamField>
+  </Expandable>
+</ParamField>
+</Card>
+### Tool Parameters
+
+#### Type Annotations
 
 Type annotations for parameters are essential for proper tool functionality. They:
 1. Inform the LLM about the expected data types for each parameter
@@ -61,7 +120,7 @@ Type annotations for parameters are essential for proper tool functionality. The
 Use standard Python type annotations for parameters:
 
 ```python
-@mcp.tool()
+@mcp.tool
 def analyze_text(
     text: str,
     max_tokens: int = 100,
@@ -79,7 +138,7 @@ You can provide additional metadata about parameters using Pydantic's `Field` cl
 from typing import Annotated
 from pydantic import Field
 
-@mcp.tool()
+@mcp.tool
 def process_image(
     image_url: Annotated[str, Field(description="URL of the image to process")],
     resize: Annotated[bool, Field(description="Whether to resize the image")] = False,
@@ -97,7 +156,7 @@ def process_image(
 You can also use the Field as a default value, though the Annotated approach is preferred:
 
 ```python
-@mcp.tool()
+@mcp.tool
 def search_database(
     query: str = Field(description="Search query string"),
     limit: int = Field(10, description="Maximum number of results", ge=1, le=100)
@@ -137,7 +196,7 @@ For additional type annotations not listed here, see the [Parameter Types](#para
 FastMCP follows Python's standard function parameter conventions. Parameters without default values are required, while those with default values are optional.
 
 ```python
-@mcp.tool()
+@mcp.tool
 def search_products(
     query: str,                   # Required - no default value
     max_results: int = 10,        # Optional - has default value
@@ -150,46 +209,55 @@ def search_products(
 
 In this example, the LLM must provide a `query` parameter, while `max_results`, `sort_by`, and `category` will use their default values if not explicitly provided.
 
-### Metadata
 
-While FastMCP infers the name and description from your function, you can override these and add tags using arguments to the `@mcp.tool` decorator:
+### Excluding Arguments
+
+<VersionBadge version="2.6.0" /> 
+
+You can exclude certain arguments from the tool schema shown to the LLM. This is useful for arguments that are injected at runtime (such as `state`, `user_id`, or credentials) and should not be exposed to the LLM or client. Only arguments with default values can be excluded; attempting to exclude a required argument will raise an error.
+
+Example:
 
 ```python
 @mcp.tool(
-    name="find_products",           # Custom tool name for the LLM
-    description="Search the product catalog with optional category filtering.", # Custom description
-    tags={"catalog", "search"},      # Optional tags for organization/filtering
+    name="get_user_details",
+    exclude_args=["user_id"]
 )
-def search_products_implementation(query: str, category: str | None = None) -> list[dict]:
-    """Internal function description (ignored if description is provided above)."""
-    # Implementation...
-    print(f"Searching for '{query}' in category '{category}'")
-    return [{"id": 2, "name": "Another Product"}]
+def get_user_details(user_id: str = None) -> str:
+    # user_id will be injected by the server, not provided by the LLM
+    ...
 ```
 
-- **`name`**: Sets the explicit tool name exposed via MCP.
-- **`description`**: Provides the description exposed via MCP. If set, the function's docstring is ignored for this purpose.
-- **`tags`**: A set of strings used to categorize the tool. Clients *might* use tags to filter or group available tools.
+With this configuration, `user_id` will not appear in the tool's parameter schema, but can still be set by the server or framework at runtime.
 
+For more complex tool transformations, see [Transforming Tools](/patterns/tool-transformation).
 
-- **`exclude_args`**:  
-    <VersionBadge version="2.6.0" /> 
-    A list of argument names to exclude from the tool schema shown to the LLM. This is useful for arguments that are injected at runtime (such as `state`, `user_id`, or credentials) and should not be exposed to the LLM or client. Only arguments with default values can be excluded; attempting to exclude a required argument will raise an error.
-  
+### Disabling Tools
 
-    Example:
+<VersionBadge version="2.8.0" />
 
-    ```python
-    @mcp.tool(
-        name="get_user_details",
-        exclude_args=["user_id"]
-    )
-    def get_user_details(user_id: str = None) -> str:
-        # user_id will be injected by the server, not provided by the LLM
-        ...
-    ```
+You can control the visibility and availability of tools by enabling or disabling them. This is useful for feature flagging, maintenance, or dynamically changing the toolset available to a client. Disabled tools will not appear in the list of available tools returned by `list_tools`, and attempting to call a disabled tool will result in an "Unknown tool" error, just as if the tool did not exist.
 
-    With this configuration, `user_id` will not appear in the tool's parameter schema, but can still be set by the server or framework at runtime.
+By default, all tools are enabled. You can disable a tool upon creation using the `enabled` parameter in the decorator:
+
+```python
+@mcp.tool(enabled=False)
+def maintenance_tool():
+    """This tool is currently under maintenance."""
+    return "This tool is disabled."
+```
+
+You can also toggle a tool's state programmatically after it has been created:
+
+```python
+@mcp.tool
+def dynamic_tool():
+    return "I am a dynamic tool."
+
+# Disable and re-enable the tool
+dynamic_tool.disable()
+dynamic_tool.enable()
+```
 
 ### Async Tools
 
@@ -197,14 +265,14 @@ FastMCP seamlessly supports both standard (`def`) and asynchronous (`async def`)
 
 ```python
 # Synchronous tool (suitable for CPU-bound or quick tasks)
-@mcp.tool()
+@mcp.tool
 def calculate_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """Calculate the distance between two coordinates."""
     # Implementation...
     return 42.5
 
 # Asynchronous tool (ideal for I/O-bound operations)
-@mcp.tool()
+@mcp.tool
 async def fetch_weather(city: str) -> dict:
     """Retrieve current weather conditions for a city."""
     # Use 'async def' for operations involving network calls, file I/O, etc.
@@ -220,50 +288,229 @@ Use `async def` when your tool needs to perform operations that might wait for e
 
 ### Return Values
 
-FastMCP automatically converts the value returned by your function into the appropriate MCP content format for the client:
 
-- **`str`**: Sent as `TextContent`.
-- **`dict`, `list`, Pydantic `BaseModel`**: Serialized to a JSON string and sent as `TextContent`.
-- **`bytes`**: Base64 encoded and sent as `BlobResourceContents` (often within an `EmbeddedResource`).
-- **`fastmcp.Image`**: A helper class for easily returning image data. Sent as `ImageContent`.
-- **`None`**: Results in an empty response (no content is sent back to the client).
+FastMCP tools can return data in two complementary formats: **traditional content blocks** (like text and images) and **structured outputs** (machine-readable JSON). When you add return type annotations, FastMCP automatically generates **output schemas** to validate the structured data and enables clients to deserialize results back to Python objects.
 
-FastMCP will attempt to serialize other types to a string if possible.
+Understanding how these three concepts work together:
 
-<Tip>
-At this time, FastMCP responds only to your tool's return *value*, not its return *annotation*.
-</Tip>
+- **Return Values**: What your Python function returns (determines both content blocks and structured data)
+- **Structured Outputs**: JSON data sent alongside traditional content for machine processing  
+- **Output Schemas**: JSON Schema declarations that describe and validate the structured output format
+
+The following sections explain each concept in detail.
+
+#### Content Blocks
+
+FastMCP automatically converts tool return values into appropriate MCP content blocks:
+
+- **`str`**: Sent as `TextContent`
+- **`bytes`**: Base64 encoded and sent as `BlobResourceContents` (within an `EmbeddedResource`)
+- **`fastmcp.utilities.types.Image`**: Sent as `ImageContent`
+- **`fastmcp.utilities.types.Audio`**: Sent as `AudioContent`
+- **`fastmcp.utilities.types.File`**: Sent as base64-encoded `EmbeddedResource`
+- **A list of any of the above**: Converts each item appropriately
+- **`None`**: Results in an empty response
+
+#### Structured Output
+
+<VersionBadge version="2.10.0" />
+
+The 6/18/2025 MCP spec update [introduced](https://modelcontextprotocol.io/specification/2025-06-18/server/tools#structured-content) structured content, which is a new way to return data from tools. Structured content is a JSON object that is sent alongside traditional content. FastMCP automatically creates structured outputs alongside traditional content when your tool returns data that has a JSON object representation. This provides machine-readable JSON data that clients can deserialize back to Python objects.
+
+**Automatic Structured Content Rules:**
+- **Object-like results** (`dict`, Pydantic models, dataclasses) → Always become structured content (even without output schema)  
+- **Non-object results** (`int`, `str`, `list`) → Only become structured content if there's an output schema to validate/serialize them
+- **All results** → Always become traditional content blocks for backward compatibility
+
+<Note>
+This automatic behavior enables clients to receive machine-readable data alongside human-readable content without requiring explicit output schemas for object-like returns.
+</Note>
+
+##### Object-like Results (Automatic Structured Content)
+
+<CodeGroup>
+```python Dict Return (No Schema Needed)
+@mcp.tool
+def get_user_data(user_id: str) -> dict:
+    """Get user data without type annotation."""
+    return {"name": "Alice", "age": 30, "active": True}
+```
+
+```json Traditional Content
+"{\n  \"name\": \"Alice\",\n  \"age\": 30,\n  \"active\": true\n}"
+```
+
+```json Structured Content (Automatic)
+{
+  "name": "Alice", 
+  "age": 30,
+  "active": true
+}
+```
+</CodeGroup>
+
+##### Non-object Results (Schema Required)
+
+<CodeGroup>
+```python Integer Return (No Schema)
+@mcp.tool  
+def calculate_sum(a: int, b: int):
+    """Calculate sum without return annotation."""
+    return a + b  # Returns 8
+```
+
+```json Traditional Content Only
+"8"
+```
+
+```python Integer Return (With Schema)
+@mcp.tool
+def calculate_sum(a: int, b: int) -> int:
+    """Calculate sum with return annotation."""  
+    return a + b  # Returns 8
+```
+
+```json Traditional Content
+"8"
+```
+
+```json Structured Content (From Schema)
+{
+  "result": 8
+}
+```
+</CodeGroup>
+
+##### Complex Type Example
+
+<CodeGroup>
+```python Tool Definition
+from dataclasses import dataclass
+from fastmcp import FastMCP
+
+mcp = FastMCP()
+
+@dataclass
+class Person:
+    name: str
+    age: int
+    email: str
+
+@mcp.tool
+def get_user_profile(user_id: str) -> Person:
+    """Get a user's profile information."""
+    return Person(name="Alice", age=30, email="alice@example.com")
+```
+
+```json Generated Output Schema
+{
+  "properties": {
+    "name": {"title": "Name", "type": "string"},
+    "age": {"title": "Age", "type": "integer"}, 
+    "email": {"title": "Email", "type": "string"}
+  },
+  "required": ["name", "age", "email"],
+  "title": "Person",
+  "type": "object"
+}
+```
+
+```json Structured Output
+{
+  "name": "Alice",
+  "age": 30,
+  "email": "alice@example.com"
+}
+```
+</CodeGroup>
+
+#### Output Schemas
+
+<VersionBadge version="2.10.0" />
+
+The 6/18/2025 MCP spec update [introduced](https://modelcontextprotocol.io/specification/2025-06-18/server/tools#output-schema) output schemas, which are a new way to describe the expected output format of a tool. When an output schema is provided, the tool *must* return structured output that matches the schema.
+
+When you add return type annotations to your functions, FastMCP automatically generates JSON schemas that describe the expected output format. These schemas help MCP clients understand and validate the structured data they receive.
+
+##### Primitive Type Wrapping
+
+For primitive return types (like `int`, `str`, `bool`), FastMCP automatically wraps the result under a `"result"` key to create valid structured output:
+
+<CodeGroup>
+```python Primitive Return Type
+@mcp.tool
+def calculate_sum(a: int, b: int) -> int:
+    """Add two numbers together."""
+    return a + b
+```
+
+```json Generated Schema (Wrapped)
+{
+  "type": "object",
+  "properties": {
+    "result": {"type": "integer"}
+  },
+  "x-fastmcp-wrap-result": true
+}
+```
+
+```json Structured Output
+{
+  "result": 8
+}
+```
+</CodeGroup>
+
+##### Manual Schema Control
+
+You can override the automatically generated schema by providing a custom `output_schema`:
 
 ```python
-from fastmcp import FastMCP, Image
-import io
-try:
-    from PIL import Image as PILImage
-except ImportError:
-    raise ImportError("Please install the `pillow` library to run this example.")
-
-mcp = FastMCP("Image Demo")
-
-@mcp.tool()
-def generate_image(width: int, height: int, color: str) -> Image:
-    """Generates a solid color image."""
-    # Create image using Pillow
-    img = PILImage.new("RGB", (width, height), color=color)
-
-    # Save to a bytes buffer
-    buffer = io.BytesIO()
-    img.save(buffer, format="PNG")
-    img_bytes = buffer.getvalue()
-
-    # Return using FastMCP's Image helper
-    return Image(data=img_bytes, format="png")
-
-@mcp.tool()
-def do_nothing() -> None:
-    """This tool performs an action but returns no data."""
-    print("Performing a side effect...")
-    return None
+@mcp.tool(output_schema={
+    "type": "object", 
+    "properties": {
+        "data": {"type": "string"},
+        "metadata": {"type": "object"}
+    }
+})
+def custom_schema_tool() -> dict:
+    """Tool with custom output schema."""
+    return {"data": "Hello", "metadata": {"version": "1.0"}}
 ```
+
+Schema generation works for most common types including basic types, collections, union types, Pydantic models, TypedDict structures, and dataclasses.
+
+<Warning>
+**Important Constraints**: 
+- Output schemas must be object types (`"type": "object"`)
+- If you provide an output schema, your tool **must** return structured output that matches it
+- However, you can provide structured output without an output schema (using `ToolResult`)
+</Warning>
+
+#### Full Control with ToolResult
+
+For complete control over both traditional content and structured output, return a `ToolResult` object:
+
+```python
+from fastmcp.tools.tool import ToolResult
+
+@mcp.tool
+def advanced_tool() -> ToolResult:
+    """Tool with full control over output."""
+    return ToolResult(
+        content=[TextContent(text="Human-readable summary")],
+        structured_content={"data": "value", "count": 42}
+    )
+```
+
+When returning `ToolResult`:
+- You control exactly what content and structured data is sent
+- Output schemas are optional - structured content can be provided without a schema
+- Clients receive both traditional content blocks and structured data
+
+<Note>
+If your return type annotation cannot be converted to a JSON schema (e.g., complex custom classes without Pydantic support), the output schema will be omitted but the tool will still function normally with traditional content.
+</Note>
 
 ### Error Handling
 
@@ -285,7 +532,7 @@ mcp = FastMCP(name="SecureServer", mask_error_details=True)
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 
-@mcp.tool()
+@mcp.tool
 def divide(a: float, b: float) -> float:
     """Divide a by b."""
 
@@ -315,7 +562,7 @@ Annotations serve several purposes in client applications:
 - Describing the safety profile of tools (destructive vs. non-destructive)
 - Signaling if tools interact with external systems
 
-You can add annotations to a tool using the `annotations` parameter in the `@mcp.tool()` decorator:
+You can add annotations to a tool using the `annotations` parameter in the `@mcp.tool` decorator:
 
 ```python
 @mcp.tool(
@@ -342,6 +589,28 @@ FastMCP supports these standard annotations:
 
 Remember that annotations help make better user experiences but should be treated as advisory hints. They help client applications present appropriate UI elements and safety controls, but won't enforce security boundaries on their own. Always focus on making your annotations accurately represent what your tool actually does.
 
+### Notifications
+
+<VersionBadge version="2.9.1" />
+
+FastMCP automatically sends `notifications/tools/list_changed` notifications to connected clients when tools are added, removed, enabled, or disabled. This allows clients to stay up-to-date with the current tool set without manually polling for changes.
+
+```python
+@mcp.tool
+def example_tool() -> str:
+    return "Hello!"
+
+# These operations trigger notifications:
+mcp.add_tool(example_tool)     # Sends tools/list_changed notification
+example_tool.disable()         # Sends tools/list_changed notification  
+example_tool.enable()          # Sends tools/list_changed notification
+mcp.remove_tool("example_tool") # Sends tools/list_changed notification
+```
+
+Notifications are only sent when these operations occur within an active MCP request context (e.g., when called from within a tool or other MCP operation). Operations performed during server initialization do not trigger notifications.
+
+Clients can handle these notifications using a [message handler](/clients/messages) to automatically refresh their tool lists or update their interfaces.
+
 ## MCP Context
 
 Tools can access MCP features like logging, reading resources, or reporting progress through the `Context` object. To use it, add a parameter to your tool function with the type hint `Context`.
@@ -351,7 +620,7 @@ from fastmcp import FastMCP, Context
 
 mcp = FastMCP(name="ContextDemo")
 
-@mcp.tool()
+@mcp.tool
 async def process_data(data_uri: str, ctx: Context) -> dict:
     """Process data from a resource with progress reporting."""
     await ctx.info(f"Processing data from {data_uri}")
@@ -396,7 +665,7 @@ FastMCP supports **type coercion** when possible. This means that if a client se
 The most common parameter types are Python's built-in scalar types:
 
 ```python
-@mcp.tool()
+@mcp.tool
 def process_values(
     name: str,             # Text data
     count: int,            # Integer numbers
@@ -416,7 +685,7 @@ FastMCP supports various date and time types from the `datetime` module:
 ```python
 from datetime import datetime, date, timedelta
 
-@mcp.tool()
+@mcp.tool
 def process_date_time(
     event_date: date,             # ISO format date string or date object
     event_time: datetime,         # ISO format datetime string or datetime object
@@ -440,7 +709,7 @@ def process_date_time(
 FastMCP supports all standard Python collection types:
 
 ```python
-@mcp.tool()
+@mcp.tool
 def analyze_data(
     values: list[float],           # List of numbers
     properties: dict[str, str],    # Dictionary with string keys and values
@@ -465,7 +734,7 @@ Collection types can be nested and combined to represent complex data structures
 For parameters that can accept multiple types or may be omitted:
 
 ```python
-@mcp.tool()
+@mcp.tool
 def flexible_search(
     query: str | int,              # Can be either string or integer
     filters: dict[str, str] | None = None,  # Optional dictionary
@@ -488,7 +757,7 @@ Literals constrain parameters to a specific set of values:
 ```python
 from typing import Literal
 
-@mcp.tool()
+@mcp.tool
 def sort_data(
     data: list[float],
     order: Literal["ascending", "descending"] = "ascending",
@@ -516,7 +785,7 @@ class Color(Enum):
     GREEN = "green"
     BLUE = "blue"
 
-@mcp.tool()
+@mcp.tool
 def process_image(
     image_path: str, 
     color_filter: Color = Color.RED
@@ -539,7 +808,7 @@ There are two approaches to handling binary data in tool parameters:
 #### Bytes
 
 ```python
-@mcp.tool()
+@mcp.tool
 def process_binary(data: bytes):
     """Process binary data directly.
     
@@ -563,7 +832,7 @@ FastMCP does not automatically decode base64-encoded strings for bytes parameter
 from typing import Annotated
 from pydantic import Field
 
-@mcp.tool()
+@mcp.tool
 def process_image_data(
     image_data: Annotated[str, Field(description="Base64-encoded image data")]
 ):
@@ -587,7 +856,7 @@ The `Path` type from the `pathlib` module can be used for file system paths:
 ```python
 from pathlib import Path
 
-@mcp.tool()
+@mcp.tool
 def process_file(path: Path) -> str:
     """Process a file at the given path."""
     assert isinstance(path, Path)  # Path is properly converted
@@ -603,7 +872,7 @@ The `UUID` type from the `uuid` module can be used for unique identifiers:
 ```python
 import uuid
 
-@mcp.tool()
+@mcp.tool
 def process_item(
     item_id: uuid.UUID  # String UUID or UUID object
 ) -> str:
@@ -628,7 +897,7 @@ class User(BaseModel):
     age: int | None = None
     is_active: bool = True
 
-@mcp.tool()
+@mcp.tool
 def create_user(user: User):
     """Create a new user in the system."""
     # The input is automatically validated against the User model
@@ -657,7 +926,7 @@ Note that fields can be used *outside* Pydantic models to provide metadata and v
 from typing import Annotated
 from pydantic import Field
 
-@mcp.tool()
+@mcp.tool
 def analyze_metrics(
     # Numbers with range constraints
     count: Annotated[int, Field(ge=0, le=100)],         # 0 <= count <= 100
@@ -682,7 +951,7 @@ def analyze_metrics(
 You can also use `Field` as a default value, though the `Annotated` approach is preferred:
 
 ```python
-@mcp.tool()
+@mcp.tool
 def validate_data(
     # Value constraints
     age: int = Field(ge=0, lt=120),                     # 0 <= age < 120
@@ -727,12 +996,12 @@ mcp = FastMCP(
     on_duplicate_tools="error"
 )
 
-@mcp.tool()
+@mcp.tool
 def my_tool(): return "Version 1"
 
 # This will now raise a ValueError because 'my_tool' already exists
 # and on_duplicate_tools is set to "error".
-# @mcp.tool()
+# @mcp.tool
 # def my_tool(): return "Version 2"
 ```
 
@@ -754,20 +1023,10 @@ from fastmcp import FastMCP
 
 mcp = FastMCP(name="DynamicToolServer")
 
-@mcp.tool()
+@mcp.tool
 def calculate_sum(a: int, b: int) -> int:
     """Add two numbers together."""
     return a + b
 
 mcp.remove_tool("calculate_sum")
 ```
-
-### Legacy JSON Parsing
-
-<VersionBadge version="2.2.10" />
-
-FastMCP 1.0 and < 2.2.10 relied on a crutch that attempted to work around LLM limitations by automatically parsing stringified JSON in tool arguments (e.g., converting `"[1,2,3]"` to `[1,2,3]`). As of FastMCP 2.2.10, this behavior is disabled by default because it circumvents type validation and can lead to unexpected type coercion issues (e.g. parsing "true" as a bool and attempting to call a tool that expected a string, which would fail type validation).
-
-Most modern LLMs correctly format JSON, but if working with models that unnecessarily stringify JSON (as was the case with Claude Desktop in late 2024), you can re-enable this behavior on your server by setting the environment variable `FASTMCP_TOOL_ATTEMPT_PARSE_JSON_ARGS=1`.
-
-We strongly recommend leaving this disabled unless necessary.

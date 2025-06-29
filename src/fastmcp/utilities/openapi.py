@@ -25,6 +25,7 @@ from openapi_pydantic.v3.v3_0 import Schema as Schema_30
 from pydantic import BaseModel, Field, ValidationError
 
 from fastmcp.utilities.json_schema import compress_schema
+from fastmcp.utilities.types import FastMCPBaseModel
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +39,7 @@ ParameterLocation = Literal["path", "query", "header", "cookie"]
 JsonSchema = dict[str, Any]
 
 
-class ParameterInfo(BaseModel):
+class ParameterInfo(FastMCPBaseModel):
     """Represents a single parameter for an HTTP operation in our IR."""
 
     name: str
@@ -48,7 +49,7 @@ class ParameterInfo(BaseModel):
     description: str | None = None
 
 
-class RequestBodyInfo(BaseModel):
+class RequestBodyInfo(FastMCPBaseModel):
     """Represents the request body for an HTTP operation in our IR."""
 
     required: bool = False
@@ -58,7 +59,7 @@ class RequestBodyInfo(BaseModel):
     description: str | None = None
 
 
-class ResponseInfo(BaseModel):
+class ResponseInfo(FastMCPBaseModel):
     """Represents response information in our IR."""
 
     description: str | None = None
@@ -66,7 +67,7 @@ class ResponseInfo(BaseModel):
     content_schema: dict[str, JsonSchema] = Field(default_factory=dict)
 
 
-class HTTPRoute(BaseModel):
+class HTTPRoute(FastMCPBaseModel):
     """Intermediate Representation for a single OpenAPI operation."""
 
     path: str
@@ -83,6 +84,7 @@ class HTTPRoute(BaseModel):
     schema_definitions: dict[str, JsonSchema] = Field(
         default_factory=dict
     )  # Store component schemas
+    extensions: dict[str, Any] = Field(default_factory=dict)
 
 
 # Export public symbols
@@ -261,16 +263,24 @@ class OpenAPIParser(
 
             if isinstance(resolved_schema, (self.schema_cls)):
                 # Convert schema to dictionary
-                return resolved_schema.model_dump(
+                result = resolved_schema.model_dump(
                     mode="json", by_alias=True, exclude_none=True
                 )
             elif isinstance(resolved_schema, dict):
-                return resolved_schema
+                result = resolved_schema
             else:
                 logger.warning(
                     f"Expected Schema after resolving, got {type(resolved_schema)}. Returning empty dict."
                 )
-                return {}
+                result = {}
+
+            return _replace_ref_with_defs(result)
+        except ValueError as e:
+            # Re-raise ValueError for external reference errors and other validation issues
+            if "External or non-local reference not supported" in str(e):
+                raise
+            logger.error(f"Failed to extract schema as dict: {e}", exc_info=False)
+            return {}
         except Exception as e:
             logger.error(f"Failed to extract schema as dict: {e}", exc_info=False)
             return {}
@@ -299,11 +309,17 @@ class OpenAPIParser(
 
                 # Extract parameter info - handle both 3.0 and 3.1 parameter models
                 param_in = parameter.param_in  # Both use param_in
-                param_location = self._convert_to_parameter_location(param_in)
+                # Handle enum or string parameter locations
+                from enum import Enum
+
+                param_in_str = (
+                    param_in.value if isinstance(param_in, Enum) else param_in
+                )
+                param_location = self._convert_to_parameter_location(param_in_str)
                 param_schema_obj = parameter.param_schema  # Both use param_schema
 
                 # Skip duplicate parameters (same name and location)
-                param_key = (parameter.name, param_in)
+                param_key = (parameter.name, param_in_str)
                 if param_key in seen_params:
                     continue
                 seen_params[param_key] = True
@@ -397,12 +413,30 @@ class OpenAPIParser(
                             request_body_info.content_schema[media_type_str] = (
                                 schema_dict
                             )
+                        except ValueError as e:
+                            # Re-raise ValueError for external reference errors
+                            if "External or non-local reference not supported" in str(
+                                e
+                            ):
+                                raise
+                            logger.error(
+                                f"Failed to extract schema for media type '{media_type_str}': {e}"
+                            )
                         except Exception as e:
                             logger.error(
                                 f"Failed to extract schema for media type '{media_type_str}': {e}"
                             )
 
             return request_body_info
+        except ValueError as e:
+            # Re-raise ValueError for external reference errors
+            if "External or non-local reference not supported" in str(e):
+                raise
+            ref_name = getattr(request_body_or_ref, "ref", "unknown")
+            logger.error(
+                f"Failed to extract request body '{ref_name}': {e}", exc_info=False
+            )
+            return None
         except Exception as e:
             ref_name = getattr(request_body_or_ref, "ref", "unknown")
             logger.error(
@@ -446,6 +480,17 @@ class OpenAPIParser(
                                     media_type_obj.media_type_schema
                                 )
                                 resp_info.content_schema[media_type_str] = schema_dict
+                            except ValueError as e:
+                                # Re-raise ValueError for external reference errors
+                                if (
+                                    "External or non-local reference not supported"
+                                    in str(e)
+                                ):
+                                    raise
+                                logger.error(
+                                    f"Failed to extract schema for media type '{media_type_str}' "
+                                    f"in response {status_code}: {e}"
+                                )
                             except Exception as e:
                                 logger.error(
                                     f"Failed to extract schema for media type '{media_type_str}' "
@@ -453,6 +498,16 @@ class OpenAPIParser(
                                 )
 
                 extracted_responses[str(status_code)] = resp_info
+            except ValueError as e:
+                # Re-raise ValueError for external reference errors
+                if "External or non-local reference not supported" in str(e):
+                    raise
+                ref_name = getattr(resp_or_ref, "ref", "unknown")
+                logger.error(
+                    f"Failed to extract response for status code {status_code} "
+                    f"from reference '{ref_name}': {e}",
+                    exc_info=False,
+                )
             except Exception as e:
                 ref_name = getattr(resp_or_ref, "ref", "unknown")
                 logger.error(
@@ -537,6 +592,14 @@ class OpenAPIParser(
                             getattr(operation, "responses", None)
                         )
 
+                        extensions = {}
+                        if hasattr(operation, "model_extra") and operation.model_extra:
+                            extensions = {
+                                k: v
+                                for k, v in operation.model_extra.items()
+                                if k.startswith("x-")
+                            }
+
                         route = HTTPRoute(
                             path=path_str,
                             method=method_upper,  # type: ignore[arg-type]  # Known valid HTTP method
@@ -548,10 +611,22 @@ class OpenAPIParser(
                             request_body=request_body_info,
                             responses=responses,
                             schema_definitions=schema_definitions,
+                            extensions=extensions,
                         )
                         routes.append(route)
                         logger.info(
                             f"Successfully extracted route: {method_upper} {path_str}"
+                        )
+                    except ValueError as op_error:
+                        # Re-raise ValueError for external reference errors
+                        if "External or non-local reference not supported" in str(
+                            op_error
+                        ):
+                            raise
+                        op_id = getattr(operation, "operationId", "unknown")
+                        logger.error(
+                            f"Failed to process operation {method_upper} {path_str} (ID: {op_id}): {op_error}",
+                            exc_info=True,
                         )
                     except Exception as op_error:
                         op_id = getattr(operation, "operationId", "unknown")
@@ -872,6 +947,56 @@ def format_description_with_responses(
     return "\n".join(desc_parts)
 
 
+def _replace_ref_with_defs(
+    info: dict[str, Any], description: str | None = None
+) -> dict[str, Any]:
+    """
+    Replace openapi $ref with jsonschema $defs
+
+    Examples:
+    - {"type": "object", "properties": {"$ref": "#/components/schemas/..."}}
+    - {"$ref": "#/components/schemas/..."}
+    - {"items": {"$ref": "#/components/schemas/..."}}
+    - {"anyOf": [{"$ref": "#/components/schemas/..."}]}
+    - {"allOf": [{"$ref": "#/components/schemas/..."}]}
+    - {"oneOf": [{"$ref": "#/components/schemas/..."}]}
+
+    Args:
+        info: dict[str, Any]
+        description: str | None
+
+    Returns:
+        dict[str, Any]
+    """
+    schema = info.copy()
+    if ref_path := schema.get("$ref"):
+        if ref_path.startswith("#/components/schemas/"):
+            schema_name = ref_path.split("/")[-1]
+            schema["$ref"] = f"#/$defs/{schema_name}"
+        elif not ref_path.startswith("#/"):
+            raise ValueError(
+                f"External or non-local reference not supported: {ref_path}. "
+                f"FastMCP only supports local schema references starting with '#/'. "
+                f"Please include all schema definitions within the OpenAPI document."
+            )
+    elif properties := schema.get("properties"):
+        if "$ref" in properties:
+            schema["properties"] = _replace_ref_with_defs(properties)
+        else:
+            schema["properties"] = {
+                prop_name: _replace_ref_with_defs(prop_schema)
+                for prop_name, prop_schema in properties.items()
+            }
+    elif item_schema := schema.get("items"):
+        schema["items"] = _replace_ref_with_defs(item_schema)
+    for section in ["anyOf", "allOf", "oneOf"]:
+        for i, item in enumerate(schema.get(section, [])):
+            schema[section][i] = _replace_ref_with_defs(item)
+    if info.get("description", description) and not schema.get("description"):
+        schema["description"] = description
+    return schema
+
+
 def _combine_schemas(route: HTTPRoute) -> dict[str, Any]:
     """
     Combines parameter and request body schemas into a single schema.
@@ -889,38 +1014,18 @@ def _combine_schemas(route: HTTPRoute) -> dict[str, Any]:
     for param in route.parameters:
         if param.required:
             required.append(param.name)
-
-        # Copy the schema and add description if available
-        param_schema = param.schema_.copy() if isinstance(param.schema_, dict) else {}
-
-        # Convert #/components/schemas references to #/$defs references
-        if isinstance(param_schema, dict) and "$ref" in param_schema:
-            ref_path = param_schema["$ref"]
-            if ref_path.startswith("#/components/schemas/"):
-                schema_name = ref_path.split("/")[-1]
-                param_schema["$ref"] = f"#/$defs/{schema_name}"
-
-        # Also handle anyOf, allOf, oneOf references
-        for section in ["anyOf", "allOf", "oneOf"]:
-            if section in param_schema and isinstance(param_schema[section], list):
-                for i, item in enumerate(param_schema[section]):
-                    if isinstance(item, dict) and "$ref" in item:
-                        ref_path = item["$ref"]
-                        if ref_path.startswith("#/components/schemas/"):
-                            schema_name = ref_path.split("/")[-1]
-                            param_schema[section][i]["$ref"] = f"#/$defs/{schema_name}"
-
-        # Add parameter description to schema if available and not already present
-        if param.description and not param_schema.get("description"):
-            param_schema["description"] = param.description
-
-        properties[param.name] = param_schema
+        properties[param.name] = _replace_ref_with_defs(
+            param.schema_.copy(), param.description
+        )
 
     # Add request body if it exists
     if route.request_body and route.request_body.content_schema:
         # For now, just use the first content type's schema
         content_type = next(iter(route.request_body.content_schema))
-        body_schema = route.request_body.content_schema[content_type]
+        body_schema = _replace_ref_with_defs(
+            route.request_body.content_schema[content_type].copy(),
+            route.request_body.description,
+        )
         body_props = body_schema.get("properties", {})
 
         # Add request body properties
@@ -935,7 +1040,6 @@ def _combine_schemas(route: HTTPRoute) -> dict[str, Any]:
         "properties": properties,
         "required": required,
     }
-
     # Add schema definitions if available
     if route.schema_definitions:
         result["$defs"] = route.schema_definitions

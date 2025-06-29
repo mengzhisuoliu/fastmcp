@@ -7,25 +7,44 @@ changelog:
     - title: New Features 🎉
       labels:
         - feature
+      exclude:
+        labels:
+          - contrib
+
+    - title: Enhancements 🔧
+      labels:
         - enhancement
       exclude:
         labels:
           - breaking change
+          - contrib
 
     - title: Fixes 🐞
       labels:
         - bug
       exclude:
         labels:
-          - breaking change
+          - contrib
 
     - title: Breaking Changes 🛫
       labels:
         - breaking change
+      exclude:
+        labels:
+          - contrib
 
     - title: Docs 📚
       labels:
         - documentation
+
+    - title: Examples & Contrib 💡
+      labels:
+        - example
+        - contrib
+
+    - title: Dependencies 📦
+      labels:
+        - dependencies
 
     - title: Other Changes 🦾
       labels:

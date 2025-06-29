@@ -2,16 +2,28 @@
 
 import base64
 import inspect
+import mimetypes
 from collections.abc import Callable
 from functools import lru_cache
 from pathlib import Path
-from types import UnionType
-from typing import Annotated, TypeVar, Union, get_args, get_origin
+from types import EllipsisType, UnionType
+from typing import Annotated, TypeAlias, TypeVar, Union, get_args, get_origin
 
-from mcp.types import ImageContent
-from pydantic import TypeAdapter
+import mcp.types
+from mcp.types import Annotations
+from pydantic import AnyUrl, BaseModel, ConfigDict, TypeAdapter, UrlConstraints
 
 T = TypeVar("T")
+
+# sentinel values for optional arguments
+NotSet = ...
+NotSetT: TypeAlias = EllipsisType
+
+
+class FastMCPBaseModel(BaseModel):
+    """Base model for FastMCP models."""
+
+    model_config = ConfigDict(extra="forbid")
 
 
 @lru_cache(maxsize=5000)
@@ -74,15 +86,6 @@ def find_kwarg_by_type(fn: Callable, kwarg_type: type) -> str | None:
     return None
 
 
-def _convert_set_defaults(maybe_set: set[T] | list[T] | None) -> set[T]:
-    """Convert a set or list to a set, defaulting to an empty set if None."""
-    if maybe_set is None:
-        return set()
-    if isinstance(maybe_set, set):
-        return maybe_set
-    return set(maybe_set)
-
-
 class Image:
     """Helper class for returning images from tools."""
 
@@ -91,6 +94,7 @@ class Image:
         path: str | Path | None = None,
         data: bytes | None = None,
         format: str | None = None,
+        annotations: Annotations | None = None,
     ):
         if path is None and data is None:
             raise ValueError("Either path or data must be provided")
@@ -101,6 +105,7 @@ class Image:
         self.data = data
         self._format = format
         self._mime_type = self._get_mime_type()
+        self.annotations = annotations
 
     def _get_mime_type(self) -> str:
         """Get MIME type from format or guess from file extension."""
@@ -118,7 +123,11 @@ class Image:
             }.get(suffix, "application/octet-stream")
         return "image/png"  # default for raw binary data
 
-    def to_image_content(self) -> ImageContent:
+    def to_image_content(
+        self,
+        mime_type: str | None = None,
+        annotations: Annotations | None = None,
+    ) -> mcp.types.ImageContent:
         """Convert to MCP ImageContent."""
         if self.path:
             with open(self.path, "rb") as f:
@@ -128,4 +137,189 @@ class Image:
         else:
             raise ValueError("No image data available")
 
-        return ImageContent(type="image", data=data, mimeType=self._mime_type)
+        return mcp.types.ImageContent(
+            type="image",
+            data=data,
+            mimeType=mime_type or self._mime_type,
+            annotations=annotations or self.annotations,
+        )
+
+
+class Audio:
+    """Helper class for returning audio from tools."""
+
+    def __init__(
+        self,
+        path: str | Path | None = None,
+        data: bytes | None = None,
+        format: str | None = None,
+        annotations: Annotations | None = None,
+    ):
+        if path is None and data is None:
+            raise ValueError("Either path or data must be provided")
+        if path is not None and data is not None:
+            raise ValueError("Only one of path or data can be provided")
+
+        self.path = Path(path) if path else None
+        self.data = data
+        self._format = format
+        self._mime_type = self._get_mime_type()
+        self.annotations = annotations
+
+    def _get_mime_type(self) -> str:
+        """Get MIME type from format or guess from file extension."""
+        if self._format:
+            return f"audio/{self._format.lower()}"
+
+        if self.path:
+            suffix = self.path.suffix.lower()
+            return {
+                ".wav": "audio/wav",
+                ".mp3": "audio/mpeg",
+                ".ogg": "audio/ogg",
+                ".m4a": "audio/mp4",
+                ".flac": "audio/flac",
+            }.get(suffix, "application/octet-stream")
+        return "audio/wav"  # default for raw binary data
+
+    def to_audio_content(
+        self,
+        mime_type: str | None = None,
+        annotations: Annotations | None = None,
+    ) -> mcp.types.AudioContent:
+        if self.path:
+            with open(self.path, "rb") as f:
+                data = base64.b64encode(f.read()).decode()
+        elif self.data is not None:
+            data = base64.b64encode(self.data).decode()
+        else:
+            raise ValueError("No audio data available")
+
+        return mcp.types.AudioContent(
+            type="audio",
+            data=data,
+            mimeType=mime_type or self._mime_type,
+            annotations=annotations or self.annotations,
+        )
+
+
+class File:
+    """Helper class for returning audio from tools."""
+
+    def __init__(
+        self,
+        path: str | Path | None = None,
+        data: bytes | None = None,
+        format: str | None = None,
+        name: str | None = None,
+        annotations: Annotations | None = None,
+    ):
+        if path is None and data is None:
+            raise ValueError("Either path or data must be provided")
+        if path is not None and data is not None:
+            raise ValueError("Only one of path or data can be provided")
+
+        self.path = Path(path) if path else None
+        self.data = data
+        self._format = format
+        self._mime_type = self._get_mime_type()
+        self._name = name
+        self.annotations = annotations
+
+    def _get_mime_type(self) -> str:
+        """Get MIME type from format or guess from file extension."""
+        if self._format:
+            fmt = self._format.lower()
+            # Map common text formats to text/plain
+            if fmt in {"plain", "txt", "text"}:
+                return "text/plain"
+            return f"application/{fmt}"
+
+        if self.path:
+            mime_type, _ = mimetypes.guess_type(self.path)
+            if mime_type:
+                return mime_type
+
+        return "application/octet-stream"
+
+    def to_resource_content(
+        self,
+        mime_type: str | None = None,
+        annotations: Annotations | None = None,
+    ) -> mcp.types.EmbeddedResource:
+        if self.path:
+            with open(self.path, "rb") as f:
+                raw_data = f.read()
+                uri_str = self.path.resolve().as_uri()
+        elif self.data is not None:
+            raw_data = self.data
+            if self._name:
+                uri_str = f"file:///{self._name}.{self._mime_type.split('/')[1]}"
+            else:
+                uri_str = f"file:///resource.{self._mime_type.split('/')[1]}"
+        else:
+            raise ValueError("No resource data available")
+
+        mime = mime_type or self._mime_type
+        UriType = Annotated[AnyUrl, UrlConstraints(host_required=False)]
+        uri = TypeAdapter(UriType).validate_python(uri_str)
+
+        if mime.startswith("text/"):
+            try:
+                text = raw_data.decode("utf-8")
+            except UnicodeDecodeError:
+                text = raw_data.decode("latin-1")
+            resource = mcp.types.TextResourceContents(
+                text=text,
+                mimeType=mime,
+                uri=uri,
+            )
+        else:
+            data = base64.b64encode(raw_data).decode()
+            resource = mcp.types.BlobResourceContents(
+                blob=data,
+                mimeType=mime,
+                uri=uri,
+            )
+
+        return mcp.types.EmbeddedResource(
+            type="resource",
+            resource=resource,
+            annotations=annotations or self.annotations,
+        )
+
+
+def replace_type(type_, type_map: dict[type, type]):
+    """
+    Given a (possibly generic, nested, or otherwise complex) type, replaces all
+    instances of old_type with new_type.
+
+    This is useful for transforming types when creating tools.
+
+    Args:
+        type_: The type to replace instances of old_type with new_type.
+        old_type: The type to replace.
+        new_type: The type to replace old_type with.
+
+    Examples:
+        >>> replace_type(list[int | bool], {int: str})
+        list[str | bool]
+
+        >>> replace_type(list[list[int]], {int: str})
+        list[list[str]]
+
+    """
+    if type_ in type_map:
+        return type_map[type_]
+
+    origin = get_origin(type_)
+    if not origin:
+        return type_
+
+    args = get_args(type_)
+    new_args = tuple(replace_type(arg, type_map) for arg in args)
+
+    if origin is UnionType:
+        return Union[new_args]  # type: ignore # noqa: UP007
+    else:
+        return origin[new_args]
