@@ -7,7 +7,7 @@ sidebarTitle: cli
 
 ## Functions
 
-### `log_server_banner` <sup><a href="https://github.com/jlowin/fastmcp/blob/main/src/fastmcp/utilities/cli.py#L26" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
+### `log_server_banner` <sup><a href="https://github.com/mengzhisuoliu/fastmcp/blob/main/src/fastmcp/utilities/cli.py#L28" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
 
 ```python
 log_server_banner(server: FastMCP[Any], transport: Literal['stdio', 'http', 'sse', 'streamable-http']) -> None
@@ -22,4 +22,51 @@ Creates and logs a formatted banner with server information and logo.
 - `host`: Host address (for HTTP transports)
 - `port`: Port number (for HTTP transports)
 - `path`: Server path (for HTTP transports)
+
+
+### `build_uv_command` <sup><a href="https://github.com/mengzhisuoliu/fastmcp/blob/main/src/fastmcp/utilities/cli.py#L115" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
+
+```python
+build_uv_command(server_spec: str) -> list[str]
+```
+
+
+Build a uv run command for running a FastMCP server.
+
+This centralized function ensures consistent path resolution and command building
+across all CLI commands.
+
+**Args:**
+- `server_spec`: Server specification (file path, optionally with \:object)
+- `with_editable`: Directory to install in editable mode
+- `with_packages`: Additional packages to install
+- `python_version`: Python version to use (e.g., "3.10", "3.11")
+- `with_requirements`: Requirements file to install from
+- `project`: Project directory to run within
+
+**Returns:**
+- List of command arguments for subprocess execution
+
+
+### `build_uv_run_args` <sup><a href="https://github.com/mengzhisuoliu/fastmcp/blob/main/src/fastmcp/utilities/cli.py#L176" target="_blank"><Icon icon="github" style="width: 14px; height: 14px;" /></a></sup>
+
+```python
+build_uv_run_args() -> list[str]
+```
+
+
+Build just the uv run arguments without the server spec.
+
+This is useful for install commands that need to build the args array
+without the full command structure.
+
+**Args:**
+- `with_editable`: Directory to install in editable mode
+- `with_packages`: Additional packages to install (fastmcp will be added automatically)
+- `python_version`: Python version to use
+- `with_requirements`: Requirements file to install from
+- `project`: Project directory to run within
+
+**Returns:**
+- List of arguments starting with "run"
 
